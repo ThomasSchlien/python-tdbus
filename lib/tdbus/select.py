@@ -12,6 +12,7 @@ import errno
 import heapq
 import select
 import time
+from threading import Lock
 
 from tdbus import _tdbus
 from tdbus.connection import DBusConnection, DBusError
@@ -69,23 +70,25 @@ class SimpleDBusConnection(DBusConnection):
 
     Loop = SelectLoop
     Local = type('Object', (object,), {})
+    mutex = Lock()
 
     def call_method(self, *args, **kwargs):
-        callback = kwargs.get('callback')
-        if callback is not None:
+        with self.mutex:
+            callback = kwargs.get('callback')
+            if callback is not None:
+                super(SimpleDBusConnection, self).call_method(*args, **kwargs)
+                return
+            replies = []
+            def _method_callback(message):
+                replies.append(message)
+                self.stop()
+            kwargs['callback'] = _method_callback
             super(SimpleDBusConnection, self).call_method(*args, **kwargs)
-            return
-        replies = []
-        def _method_callback(message):
-            replies.append(message)
-            self.stop()
-        kwargs['callback'] = _method_callback
-        super(SimpleDBusConnection, self).call_method(*args, **kwargs)
-        self.dispatch()
-        assert len(replies) == 1
-        reply = replies[0]
-        self._handle_errors(reply)
-        return reply
+            self.dispatch()
+            assert len(replies) == 1
+            reply = replies[0]
+            self._handle_errors(reply)
+            return reply
 
     def dispatch(self):
         """Start the loop."""
