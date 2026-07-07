@@ -81,9 +81,17 @@ static struct PyModuleDef moduledef;
 static struct module_state _state;
 #endif
 
+/* NOTE: libdbus may invoke the callbacks below from contexts where no Python
+ * thread state is attached, e.g. from inside dbus_connection_flush() while
+ * the calling thread released the GIL, or on a free-threaded build from any
+ * thread. Every callback must therefore bracket its Python API usage with
+ * PyGILState_Ensure()/PyGILState_Release(). */
+
 void _tdbus_decref(void *data)
 {
+    PyGILState_STATE gstate = PyGILState_Ensure();
     Py_DECREF((PyObject *) data);
+    PyGILState_Release(gstate);
 }
 
 
@@ -1314,16 +1322,19 @@ static void
 _tdbus_pending_call_notify_callback(DBusPendingCall *pending, void *data)
 {
     PyTDBusMessageObject *Pmessage;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     if ((Pmessage = PyObject_New(PyTDBusMessageObject, &PyTDBusMessageType)) == NULL)
-        return;
+        goto out;
     Pmessage->message = dbus_pending_call_steal_reply(pending);
     if (Pmessage->message == NULL)
-        return;
+        goto out;
     PyObject_CallFunction((PyObject *) data, "O", Pmessage);
     if (PyErr_Occurred())
         PyErr_Clear();
     Py_DECREF(Pmessage);
+out:
+    PyGILState_Release(gstate);
 }
 
 static PyObject *
@@ -1520,10 +1531,13 @@ _tdbus_add_watch_callback(DBusWatch *watch, void *data)
 {
     PyTDBusWatchObject *Pwatch;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     if ((Pwatch = dbus_watch_get_data(watch)) == NULL) {
-        if ((Pwatch = PyObject_New(PyTDBusWatchObject, &PyTDBusWatchType)) == NULL)
+        if ((Pwatch = PyObject_New(PyTDBusWatchObject, &PyTDBusWatchType)) == NULL) {
+            PyGILState_Release(gstate);
             return FALSE;
+        }
         Pwatch->watch = watch;
         Pwatch->data = NULL;
         dbus_watch_set_data(watch, Pwatch, _tdbus_decref);
@@ -1532,6 +1546,7 @@ _tdbus_add_watch_callback(DBusWatch *watch, void *data)
     Py_XDECREF(ret);
     if (PyErr_Occurred())
         PyErr_Clear();
+    PyGILState_Release(gstate);
     return TRUE;
 }
 
@@ -1540,6 +1555,7 @@ _tdbus_remove_watch_callback(DBusWatch *watch, void *data)
 {
     PyObject *Pwatch;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     Pwatch = dbus_watch_get_data(watch);
     ASSERT(Pwatch != NULL);
@@ -1548,6 +1564,7 @@ _tdbus_remove_watch_callback(DBusWatch *watch, void *data)
     if (PyErr_Occurred())
         PyErr_Clear();
 error:
+    PyGILState_Release(gstate);
     return;
 }
 
@@ -1556,6 +1573,7 @@ _tdbus_watch_toggled_callback(DBusWatch *watch, void *data)
 {
     PyObject *Pwatch;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     Pwatch = dbus_watch_get_data(watch);
     ASSERT(Pwatch != NULL);
@@ -1564,6 +1582,7 @@ _tdbus_watch_toggled_callback(DBusWatch *watch, void *data)
     if (PyErr_Occurred())
         PyErr_Clear();
 error:
+    PyGILState_Release(gstate);
     return;
 }
 
@@ -1572,10 +1591,13 @@ _tdbus_add_timeout_callback(DBusTimeout *timeout, void *data)
 {
     PyTDBusTimeoutObject *Ptimeout;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     if ((Ptimeout = dbus_timeout_get_data(timeout)) == NULL) {
-        if ((Ptimeout = PyObject_New(PyTDBusTimeoutObject, &PyTDBusTimeoutType)) == NULL)
+        if ((Ptimeout = PyObject_New(PyTDBusTimeoutObject, &PyTDBusTimeoutType)) == NULL) {
+            PyGILState_Release(gstate);
             return FALSE;
+        }
         Ptimeout->timeout = timeout;
         Ptimeout->data = NULL;
         dbus_timeout_set_data(timeout, Ptimeout, _tdbus_decref);
@@ -1584,6 +1606,7 @@ _tdbus_add_timeout_callback(DBusTimeout *timeout, void *data)
     Py_XDECREF(ret);
     if (PyErr_Occurred())
         PyErr_Clear();
+    PyGILState_Release(gstate);
     return TRUE;
 }
 
@@ -1592,6 +1615,7 @@ _tdbus_remove_timeout_callback(DBusTimeout *timeout, void *data)
 {
     PyObject *Ptimeout;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     Ptimeout = dbus_timeout_get_data(timeout);
     ASSERT(Ptimeout != NULL);
@@ -1600,6 +1624,7 @@ _tdbus_remove_timeout_callback(DBusTimeout *timeout, void *data)
     if (PyErr_Occurred())
         PyErr_Clear();
 error:
+    PyGILState_Release(gstate);
     return;
 }
 
@@ -1608,6 +1633,7 @@ _tdbus_timeout_toggled_callback(DBusTimeout *timeout, void *data)
 {
     PyObject *Ptimeout;
     PyObject *ret;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
     Ptimeout = dbus_timeout_get_data(timeout);
     ASSERT(Ptimeout != NULL);
@@ -1616,6 +1642,7 @@ _tdbus_timeout_toggled_callback(DBusTimeout *timeout, void *data)
     if (PyErr_Occurred())
         PyErr_Clear();
 error:
+    PyGILState_Release(gstate);
     return;
 }
 
@@ -1666,9 +1693,12 @@ _tdbus_connection_filter_callback(DBusConnection *connection,
     int ret;
     PyObject *Presult;
     PyTDBusMessageObject *Pmessage;
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
-    if ((Pmessage = PyObject_New(PyTDBusMessageObject, &PyTDBusMessageType)) == NULL)
+    if ((Pmessage = PyObject_New(PyTDBusMessageObject, &PyTDBusMessageType)) == NULL) {
+        PyGILState_Release(gstate);
         return DBUS_HANDLER_RESULT_NEED_MEMORY;
+    }
     dbus_message_ref(message);
     Pmessage->message = message;
 
@@ -1676,6 +1706,7 @@ _tdbus_connection_filter_callback(DBusConnection *connection,
     Py_DECREF(Pmessage);
     if (Presult == NULL) {
         PyErr_Clear();
+        PyGILState_Release(gstate);
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     }
     if (PyObject_IsTrue(Presult))
@@ -1683,6 +1714,7 @@ _tdbus_connection_filter_callback(DBusConnection *connection,
     else
         ret = DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     Py_DECREF(Presult);
+    PyGILState_Release(gstate);
     return ret;
 }
 
