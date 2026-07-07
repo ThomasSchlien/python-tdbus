@@ -989,7 +989,7 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
 {
     int i, size, subiter_open = 0; long l;
     char *subtype = NULL, *end, *ptr;
-    PyObject *Parray = NULL, *Putf8, *Pitem = NULL, *Ptype = NULL, *Pvalue = NULL;
+    PyObject *Parray = NULL, *Putf8 = NULL, *Pitem = NULL, *Ptype = NULL, *Pvalue = NULL;
     _tdbus_basic_value value;
     DBusMessageIter subiter;
 
@@ -1076,8 +1076,9 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
         if (PyUnicode_Check(arg)) {
             Putf8 = PyUnicode_AsUTF8String(arg);
             CHECK_PYTHON_ERROR(Putf8 == NULL);
+            /* value.str points into Putf8; keep Putf8 alive until libdbus
+             * has copied the string in append_basic */
             value.str = PyBytes_AsString(Putf8);
-            Py_CLEAR(Putf8);
             CHECK_PYTHON_ERROR(value.str == NULL);
         } else
             RETURN_ERROR("expecting str for `%c' format", *format);
@@ -1085,6 +1086,7 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
             RETURN_ERROR("invalid object path argument");
         if (!dbus_message_iter_append_basic(iter, *format, &value))
             RETURN_MEMORY_ERROR();
+        Py_CLEAR(Putf8);
         break;
     case DBUS_TYPE_SIGNATURE:
 #if PY_MAJOR_VERSION < 3
@@ -1245,6 +1247,7 @@ error:
          * half-built message is discarded by the caller anyway */
         dbus_message_iter_abandon_container(iter, &subiter);
     if (Parray != NULL && Parray != arg) Py_DECREF(Parray);
+    if (Putf8 != NULL) Py_DECREF(Putf8);
     if (Pitem != NULL) Py_DECREF(Pitem);
     if (Ptype != NULL) Py_DECREF(Ptype);
     if (Pvalue != NULL) Py_DECREF(Pvalue);
