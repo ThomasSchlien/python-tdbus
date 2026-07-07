@@ -28,6 +28,18 @@
     #define PyString_FromString PyUnicode_FromString
 #endif
 
+/* On free-threaded (no-GIL) builds, object state that used to be implicitly
+ * protected by the GIL needs per-object locking. On GIL builds these are
+ * no-ops. Code between TDBUS_LOCK and TDBUS_UNLOCK must not return, goto or
+ * declare variables that outlive the section. */
+#ifdef Py_GIL_DISABLED
+    #define TDBUS_LOCK(op) Py_BEGIN_CRITICAL_SECTION(op)
+    #define TDBUS_UNLOCK() Py_END_CRITICAL_SECTION()
+#else
+    #define TDBUS_LOCK(op) do { } while (0)
+    #define TDBUS_UNLOCK() do { } while (0)
+#endif
+
 /*
  * Some macros to make Python extensions in C less verbose.
  */
@@ -182,32 +194,39 @@ error:
 static PyObject *
 tdbus_watch_get_data(PyTDBusWatchObject *self, PyObject *args)
 {
+    PyObject *data;
+
     if (!PyArg_ParseTuple(args, ":get_data"))
         return NULL;
 
-    if (self->data == NULL) {
+    TDBUS_LOCK(self);
+    data = self->data;
+    Py_XINCREF(data);
+    TDBUS_UNLOCK();
+    if (data == NULL) {
         Py_INCREF(Py_None);
         return Py_None;
     }
-    return self->data;
+    return data;
 }
 
 static PyObject *
 tdbus_watch_set_data(PyTDBusWatchObject *self, PyObject *args)
 {
-    PyObject *data;
+    PyObject *data, *old;
 
     if (!PyArg_ParseTuple(args, "O:set_data", &data))
         return NULL;
 
-    if (self->data != NULL)
-        Py_DECREF(self->data);
-    if (data == Py_None) {
-        self->data = NULL;
-    } else {
+    if (data == Py_None)
+        data = NULL;
+    else
         Py_INCREF(data);
-        self->data = data;
-    }
+    TDBUS_LOCK(self);
+    old = self->data;
+    self->data = data;
+    TDBUS_UNLOCK();
+    Py_XDECREF(old);
 
     Py_INCREF(Py_None);
     return Py_None;
@@ -309,32 +328,39 @@ error:
 static PyObject *
 tdbus_timeout_get_data(PyTDBusTimeoutObject *self, PyObject *args)
 {
+    PyObject *data;
+
     if (!PyArg_ParseTuple(args, ":get_data"))
         return NULL;
 
-    if (self->data == NULL) {
+    TDBUS_LOCK(self);
+    data = self->data;
+    Py_XINCREF(data);
+    TDBUS_UNLOCK();
+    if (data == NULL) {
         Py_INCREF(Py_None);
         return Py_None;
     }
-    return self->data;
+    return data;
 }
 
 static PyObject *
 tdbus_timeout_set_data(PyTDBusTimeoutObject *self, PyObject *args)
 {
-    PyObject *data;
+    PyObject *data, *old;
 
     if (!PyArg_ParseTuple(args, "O:set_data", &data))
         return NULL;
 
-    if (self->data != NULL)
-        Py_DECREF(self->data);
-    if (data == Py_None) {
-        self->data = NULL;
-    } else {
+    if (data == Py_None)
+        data = NULL;
+    else
         Py_INCREF(data);
-        self->data = data;
-    }
+    TDBUS_LOCK(self);
+    old = self->data;
+    self->data = data;
+    TDBUS_UNLOCK();
+    Py_XDECREF(old);
 
     Py_INCREF(Py_None);
     return Py_None;
@@ -1434,6 +1460,24 @@ error:
     return NULL;
 }
 
+/* Return self->connection with a new libdbus reference (or NULL if not
+ * connected). Taking a reference under the lock keeps the DBusConnection
+ * alive even if another thread calls close() while we are using it; libdbus
+ * itself is thread-safe (dbus_threads_init_default() is called at module
+ * init). Callers must dbus_connection_unref() the result. */
+static DBusConnection *
+_tdbus_connection_get_ref(PyTDBusConnectionObject *self)
+{
+    DBusConnection *connection;
+
+    TDBUS_LOCK(self);
+    connection = self->connection;
+    if (connection != NULL)
+        dbus_connection_ref(connection);
+    TDBUS_UNLOCK();
+    return connection;
+}
+
 static int
 tdbus_connection_init(PyTDBusConnectionObject *self, PyObject *args,
                       PyObject *kwargs)
@@ -1473,15 +1517,28 @@ static PyObject *
 tdbus_connection_open(PyTDBusConnectionObject *self, PyObject *args)
 {
     const char *address;
+    DBusConnection *connection, *old;
 
     if (!PyArg_ParseTuple(args, "s:open", &address))
         return NULL;
 
-    self->connection = _tdbus_connection_open(address);
-    if (self->connection == NULL)
+    connection = _tdbus_connection_open(address);
+    if (connection == NULL)
         RETURN_ERROR(NULL);
-    if (!dbus_connection_set_data(self->connection, GETSTATE()->app_slot, self, NULL))
+    if (!dbus_connection_set_data(connection, GETSTATE()->app_slot, self, NULL)) {
+        dbus_connection_close(connection);
+        dbus_connection_unref(connection);
         RETURN_ERROR("dbus_connection_set_data() failed");
+    }
+
+    TDBUS_LOCK(self);
+    old = self->connection;
+    self->connection = connection;
+    TDBUS_UNLOCK();
+    if (old != NULL) {
+        dbus_connection_close(old);
+        dbus_connection_unref(old);
+    }
 
     Py_INCREF(Py_None);
     return Py_None;
@@ -1493,13 +1550,18 @@ error:
 static PyObject *
 tdbus_connection_close(PyTDBusConnectionObject *self, PyObject *args)
 {
+    DBusConnection *connection;
+
     if (!PyArg_ParseTuple(args, ":close"))
         return NULL;
 
-    if (self->connection != NULL) {
-        dbus_connection_close(self->connection);
-        dbus_connection_unref(self->connection);
-        self->connection = NULL;
+    TDBUS_LOCK(self);
+    connection = self->connection;
+    self->connection = NULL;
+    TDBUS_UNLOCK();
+    if (connection != NULL) {
+        dbus_connection_close(connection);
+        dbus_connection_unref(connection);
     }
 
     Py_INCREF(Py_None);
@@ -1509,18 +1571,27 @@ tdbus_connection_close(PyTDBusConnectionObject *self, PyObject *args)
 static PyObject *
 tdbus_connection_get_loop(PyTDBusConnectionObject *self, PyObject *args)
 {
+    PyObject *loop;
+    int connected;
+
     if (!PyArg_ParseTuple(args, ":get_loop"))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
 
-    if (self->loop == NULL) {
+    TDBUS_LOCK(self);
+    connected = (self->connection != NULL);
+    loop = self->loop;
+    Py_XINCREF(loop);
+    TDBUS_UNLOCK();
+    if (!connected) {
+        Py_XDECREF(loop);
+        RETURN_ERROR("not connected");
+    }
+
+    if (loop == NULL) {
         Py_INCREF(Py_None);
         return Py_None;
-    } else {
-        Py_INCREF(self->loop);
-        return self->loop;
     }
+    return loop;
 
 error:
     return NULL;
@@ -1649,12 +1720,13 @@ error:
 static PyObject *
 tdbus_connection_set_loop(PyTDBusConnectionObject *self, PyObject *args)
 {
-    PyObject *loop;
-    
+    PyObject *loop, *old;
+    DBusConnection *connection = NULL;
+
     if (!PyArg_ParseTuple(args, "O:set_loop", &loop))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
     if (!PyObject_HasAttrString(loop, "add_watch") ||
                 !PyObject_HasAttrString(loop, "remove_watch") ||
@@ -1665,24 +1737,31 @@ tdbus_connection_set_loop(PyTDBusConnectionObject *self, PyObject *args)
         RETURN_ERROR("expecting an EventLoop like object");
 
     Py_INCREF(loop);
+    TDBUS_LOCK(self);
+    old = self->loop;
     self->loop = loop;
+    TDBUS_UNLOCK();
+    Py_XDECREF(old);
 
     Py_INCREF(loop);
-    if (!dbus_connection_set_watch_functions(self->connection,
+    if (!dbus_connection_set_watch_functions(connection,
             _tdbus_add_watch_callback, _tdbus_remove_watch_callback,
             _tdbus_watch_toggled_callback, loop, _tdbus_decref))
         RETURN_ERROR("dbus_connection_set_watch_functions() failed");
 
     Py_INCREF(loop);
-    if (!dbus_connection_set_timeout_functions(self->connection,
+    if (!dbus_connection_set_timeout_functions(connection,
             _tdbus_add_timeout_callback, _tdbus_remove_timeout_callback,
             _tdbus_timeout_toggled_callback, loop, _tdbus_decref))
-        RETURN_ERROR("dbus_connection_set_watch_functions() failed");
+        RETURN_ERROR("dbus_connection_set_timeout_functions() failed");
 
+    dbus_connection_unref(connection);
     Py_INCREF(Py_None);
     return Py_None;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1722,22 +1801,28 @@ static PyObject *
 tdbus_connection_add_filter(PyTDBusConnectionObject *self, PyObject *args)
 {
     PyObject *filter;
+    DBusConnection *connection = NULL;
 
     if (!PyArg_ParseTuple(args, "O:add_filter", &filter))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
     if (!PyCallable_Check(filter))
         RETURN_ERROR("expecting a Python callable");
     Py_INCREF(filter);
-    if (!dbus_connection_add_filter(self->connection,
-                _tdbus_connection_filter_callback, filter, _tdbus_decref))
+    if (!dbus_connection_add_filter(connection,
+                _tdbus_connection_filter_callback, filter, _tdbus_decref)) {
+        Py_DECREF(filter);
         RETURN_ERROR("dbus_connection_add_filter() failed");
+    }
+    dbus_connection_unref(connection);
     Py_INCREF(Py_None);
     return Py_None;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1748,14 +1833,18 @@ tdbus_connection_send(PyTDBusConnectionObject *self, PyObject *args)
     PyObject *Pserial;
     PyTDBusMessageObject *message;
 
+    DBusConnection *connection = NULL;
+
     if (!PyArg_ParseTuple(args, "O!:send", &PyTDBusMessageType, &message))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
-    if (!dbus_connection_send(self->connection, message->message, &serial))
+    if (!dbus_connection_send(connection, message->message, &serial))
         RETURN_ERROR("dbus_connection_send() failed");
-    
+    dbus_connection_unref(connection);
+    connection = NULL;
+
     if (sizeof(long) == 8)
         Pserial = PyInt_FromLong(serial);
     else
@@ -1764,6 +1853,8 @@ tdbus_connection_send(PyTDBusConnectionObject *self, PyObject *args)
     return Pserial;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1774,16 +1865,19 @@ tdbus_connection_send_with_reply(PyTDBusConnectionObject *self, PyObject *args)
     PyTDBusPendingCallObject *Ppending;
     PyTDBusMessageObject *message;
     DBusPendingCall *pending = NULL;
+    DBusConnection *connection = NULL;
 
     if (!PyArg_ParseTuple(args, "O!|i:send", &PyTDBusMessageType, &message,
                           &timeout))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
-    if (!dbus_connection_send_with_reply(self->connection, message->message,
+    if (!dbus_connection_send_with_reply(connection, message->message,
                 &pending, timeout) || (pending == NULL))
         RETURN_ERROR("dbus_connection_send_with_reply() failed");
+    dbus_connection_unref(connection);
+    connection = NULL;
 
     Ppending = PyObject_New(PyTDBusPendingCallObject, &PyTDBusPendingCallType);
     CHECK_PYTHON_ERROR(Ppending == NULL);
@@ -1792,6 +1886,8 @@ tdbus_connection_send_with_reply(PyTDBusConnectionObject *self, PyObject *args)
 
 error:
     if (pending != NULL) dbus_pending_call_unref(pending);
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1800,32 +1896,40 @@ tdbus_connection_dispatch(PyTDBusConnectionObject *self, PyObject *args)
 {
     int status;
     PyObject *Pstatus;
+    DBusConnection *connection = NULL;
 
     if (!PyArg_ParseTuple(args, ":dispatch"))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
-    status = dbus_connection_dispatch(self->connection);
+    status = dbus_connection_dispatch(connection);
+    dbus_connection_unref(connection);
+    connection = NULL;
     Pstatus = PyInt_FromLong(status);
     CHECK_PYTHON_ERROR(Pstatus == NULL);
     return Pstatus;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
 static PyObject *
 tdbus_connection_flush(PyTDBusConnectionObject *self, PyObject *args)
 {
+    DBusConnection *connection = NULL;
+
     if (!PyArg_ParseTuple(args, ":flush"))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
     Py_BEGIN_ALLOW_THREADS
-    dbus_connection_flush(self->connection);
+    dbus_connection_flush(connection);
     Py_END_ALLOW_THREADS
+    dbus_connection_unref(connection);
 
     Py_INCREF(Py_None);
     return Py_None;
@@ -1839,19 +1943,23 @@ tdbus_connection_get_unique_name(PyTDBusConnectionObject *self, PyObject *args)
 {
     const char *name;
     PyObject *Paddress;
+    DBusConnection *connection = NULL;
 
     if (!PyArg_ParseTuple(args, ":get_unique_name"))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
-    if ((name = dbus_bus_get_unique_name(self->connection)) == NULL)
+    if ((name = dbus_bus_get_unique_name(connection)) == NULL)
         RETURN_ERROR("dbus_bus_get_unique_name() failed");
     if ((Paddress = PyUnicode_FromString(name)) == NULL)
         RETURN_ERROR(NULL);
+    dbus_connection_unref(connection);
     return Paddress;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1860,18 +1968,23 @@ tdbus_connection_get_dispatch_status(PyTDBusConnectionObject *self, PyObject *ar
 {
     int status;
     PyObject *Pstatus;
+    DBusConnection *connection = NULL;
 
     if (!PyArg_ParseTuple(args, ":get_dispatch_status"))
         return NULL;
-    if (self->connection == NULL)
-        RETURN_ERROR("not connected");
+    connection = _tdbus_connection_get_ref(self);
+    CHECK_ERROR(connection == NULL, "not connected");
 
-    status = dbus_connection_get_dispatch_status(self->connection);
+    status = dbus_connection_get_dispatch_status(connection);
+    dbus_connection_unref(connection);
+    connection = NULL;
     Pstatus = PyInt_FromLong(status);
     CHECK_PYTHON_ERROR(Pstatus == NULL);
     return Pstatus;
 
 error:
+    if (connection != NULL)
+        dbus_connection_unref(connection);
     return NULL;
 }
 
@@ -1942,6 +2055,14 @@ void init_tdbus(void) {
     if ((Pmodule = Py_InitModule("_tdbus", tdbus_methods)) == NULL)
 #endif
         INITERROR;
+
+#ifdef Py_GIL_DISABLED
+    /* Declare that this module is safe to run without the GIL. Without this,
+     * a free-threaded interpreter re-enables the GIL when the module is
+     * imported. */
+    if (PyUnstable_Module_SetGIL(Pmodule, Py_MOD_GIL_NOT_USED) < 0)
+        INITERROR;
+#endif
 
     struct module_state *state = GETMSTATE(Pmodule);
     state->error = NULL;
