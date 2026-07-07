@@ -255,6 +255,14 @@ class MessageTest(BaseTest):
         with self.assertRaises(DBusError):
             self.echo('ay', ([1, 2, 3],))
 
+    def test_arg_byte_array_large(self):
+        # Regression test for https://github.com/hmvp/python-tdbus/issues/17:
+        # multi-megabyte messages toggle the write watch repeatedly while the
+        # outgoing queue drains, which used to crash the gevent loop through
+        # a reference underflow in watch.get_data().
+        data = b'x' * 5000000
+        assert self.echo('ay', (data,)) == (data,)
+
     def test_exceptions(self):
         error = self.echo_exception('ss', ['SpecialException', 'message'])
         print(error, type(error))
@@ -389,11 +397,15 @@ class TestMessageSignal(unittest.TestCase, MessageTest):
         cls.client = GEventDBusConnection(DBUS_BUS_SESSION)
 
     def echo(self, signature=None, args=None):
+        self.__class__.last_message = None
         self.client.send_signal('/', 'Echo', IFACE_EXAMPLE, signature, args,
                                        destination=self.server_name)
 
-        # Wait a sec to server can process the message
-        gevent.sleep(0.1)
+        # Wait until the server has processed the message
+        for _ in range(500):
+            if self.last_message is not None:
+                break
+            gevent.sleep(0.01)
         return self.last_message.get_args()
 
 
@@ -418,8 +430,12 @@ class TestMessageSignalMatched(unittest.TestCase, MessageTest):
         cls.client = GEventDBusConnection(DBUS_BUS_SESSION)
 
     def echo(self, signature=None, args=None):
+        self.__class__.last_message = None
         self.client.send_signal('/', 'Echo', IFACE_EXAMPLE, signature, args)
 
-        # Wait a sec to server can process the message
-        gevent.sleep(0.01)
+        # Wait until the server has processed the message
+        for _ in range(500):
+            if self.last_message is not None:
+                break
+            gevent.sleep(0.01)
         return self.last_message.get_args()
