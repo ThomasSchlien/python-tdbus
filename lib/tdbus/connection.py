@@ -155,7 +155,7 @@ class DBusConnection(object):
         #Dispatch objects
         dbus_object = self.objects.get(message.get_path(), None)
         if dbus_object:
-            self.spawn(dbus_object.dispatch, self, message, ignore_path)
+            self.spawn(dbus_object.dispatch, self, message, True)
 
         return True
 
