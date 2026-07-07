@@ -10,9 +10,10 @@ from __future__ import division, absolute_import
 
 import errno
 import heapq
+import itertools
 import select
 import time
-from threading import Lock
+from threading import RLock
 
 from tdbus import _tdbus
 from tdbus.connection import DBusConnection, DBusError
@@ -35,6 +36,9 @@ class SelectLoop(EventLoop):
         self._connection = connection
         self.watches = []
         self.timeouts = []
+        # tiebreaker for heap entries with equal expiry times; Timeout
+        # objects themselves are not orderable
+        self._counter = itertools.count()
 
     def add_watch(self, watch):
         self.watches.append(watch)
@@ -46,12 +50,12 @@ class SelectLoop(EventLoop):
         pass
 
     def add_timeout(self, timeout):
-        expires = time.time() + timeout.get_interval() / 1000
-        heapq.heappush(self.timeouts, (expires, timeout))
+        expires = time.monotonic() + timeout.get_interval() / 1000
+        heapq.heappush(self.timeouts, (expires, next(self._counter), timeout))
 
     def remove_timeout(self, timeout):
         for i in range(len(self.timeouts)):
-            if self.timeouts[i][1] is timeout:
+            if self.timeouts[i][2] is timeout:
                 del self.timeouts[i]
                 heapq.heapify(self.timeouts)
                 break
@@ -70,7 +74,13 @@ class SimpleDBusConnection(DBusConnection):
 
     Loop = SelectLoop
     Local = type('Object', (object,), {})
-    mutex = Lock()
+
+    def __init__(self, address):
+        super(SimpleDBusConnection, self).__init__(address)
+        # Serializes blocking method calls from multiple threads. An RLock
+        # so that a handler invoked during dispatch() may itself issue a
+        # nested call_method() without deadlocking.
+        self.mutex = RLock()
 
     def call_method(self, *args, **kwargs):
         with self.mutex:
@@ -84,8 +94,10 @@ class SimpleDBusConnection(DBusConnection):
                 self.stop()
             kwargs['callback'] = _method_callback
             super(SimpleDBusConnection, self).call_method(*args, **kwargs)
-            self.dispatch()
-            assert len(replies) == 1
+            # A nested call_method() from a handler stops the loop early, so
+            # keep dispatching until our own reply has arrived.
+            while not replies:
+                self.dispatch()
             reply = replies[0]
             self._handle_errors(reply)
             return reply
@@ -106,14 +118,15 @@ class SimpleDBusConnection(DBusConnection):
                 if flags & _tdbus.DBUS_WATCH_WRITABLE:
                     wfds.append(fd)
             if loop.timeouts:
-                timeout = loop.timeouts[0][0]
+                timeout = max(0, loop.timeouts[0][0] - time.monotonic())
             else:
                 timeout = 4
             try:
                 rfds, wfds, _ = select.select(rfds, wfds, [], timeout)
-            except select.error as e:
-                if e[0] != errno.EINTR:
+            except OSError as e:
+                if e.errno != errno.EINTR:
                     raise
+                rfds, wfds = [], []
             for watch in loop.watches:
                 if not watch.get_enabled():
                     continue
@@ -125,11 +138,15 @@ class SimpleDBusConnection(DBusConnection):
                     flags |= _tdbus.DBUS_WATCH_WRITABLE
                 if flags:
                     watch.handle(flags)
-            now = time.time()
+            now = time.monotonic()
             while loop.timeouts and loop.timeouts[0][0] < now:
-                expires, timeout = heapq.heappop(loop.timeouts)
+                expires, _, timeout = heapq.heappop(loop.timeouts)
+                # re-arm before handling so that remove_timeout() calls made
+                # from within handle() see (and can remove) this timeout
+                heapq.heappush(loop.timeouts,
+                               (expires + timeout.get_interval() / 1000,
+                                next(loop._counter), timeout))
                 timeout.handle()
-                heapq.heappush(loop.timeouts, (expires + timeout.get_interval() / 1000,))
             while self._connection.get_dispatch_status() == \
                         _tdbus.DBUS_DISPATCH_DATA_REMAINS:
                 self._connection.dispatch()
