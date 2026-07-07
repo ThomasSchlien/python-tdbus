@@ -7,10 +7,11 @@ Copyright (c) 2012 the python-tdbus authors. See the file "AUTHORS" for a
 complete list.
 """
 import gc
+import os
 import unittest
 import weakref
 
-from tdbus import SimpleDBusConnection, DBUS_BUS_SESSION
+from tdbus import _tdbus, SimpleDBusConnection, DBUS_BUS_SESSION
 from .base import BaseTest
 
 try:
@@ -54,6 +55,20 @@ class TestSimpleDBusConnection(unittest.TestCase, BaseTest):
         del conn
         gc.collect()
         self.assertIsNone(ref())
+
+    @unittest.skipUnless(os.path.isdir('/proc/self/fd'),
+                         'requires /proc file descriptor listing')
+    def test_connection_reinit_does_not_leak(self):
+        # __init__ called a second time must close the previous libdbus
+        # connection instead of leaking it and its file descriptor.
+        conn = _tdbus.Connection(DBUS_BUS_SESSION)
+        numfds = len(os.listdir('/proc/self/fd'))
+        for _ in range(4):
+            conn.__init__(DBUS_BUS_SESSION)
+        self.assertEqual(len(os.listdir('/proc/self/fd')), numfds)
+        # the connection swapped in last must be usable
+        self.assertTrue(conn.get_unique_name().startswith(':'))
+        conn.close()
 
     def test_connection_collected_without_close(self):
         conn = SimpleDBusConnection(DBUS_BUS_SESSION)

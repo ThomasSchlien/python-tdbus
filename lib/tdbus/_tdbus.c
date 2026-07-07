@@ -844,14 +844,22 @@ _tdbus_init_check_number_cache(void)
     MALLOC(_tdbus_check_number_cache, 11 * sizeof(PyObject *));
     for (i=0; i<11; i++) {
         if ((Pnumber = PyInt_FromString(_tdbus_check_numbers[i],
-                    NULL, 0)) == NULL)
+                    NULL, 0)) == NULL) {
+            while (--i >= 0)
+                Py_DECREF(_tdbus_check_number_cache[i]);
             RETURN_ERROR(NULL);
+        }
         _tdbus_check_number_cache[i] = Pnumber;
     }
     return 1;
 
 error:
-    if (_tdbus_check_number_cache != NULL) free(_tdbus_check_number_cache);
+    /* reset to NULL so a retried initialization does not see a freed cache
+     * as already initialized */
+    if (_tdbus_check_number_cache != NULL) {
+        free(_tdbus_check_number_cache);
+        _tdbus_check_number_cache = NULL;
+    }
     return 0;
 }
 
@@ -1513,16 +1521,29 @@ tdbus_connection_init(PyTDBusConnectionObject *self, PyObject *args,
 {
     char *address = NULL;
     static char *kwlist[] = { "address", NULL };
+    DBusConnection *connection, *old;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s", kwlist, &address))
         return -1;
 
     if (address != NULL) {
-        self->connection = _tdbus_connection_open(address);
-        if (self->connection == NULL)
+        connection = _tdbus_connection_open(address);
+        if (connection == NULL)
             return -1;
-        if (!dbus_connection_set_data(self->connection, GETSTATE()->app_slot, self, NULL))
+        if (!dbus_connection_set_data(connection, GETSTATE()->app_slot, self, NULL)) {
+            dbus_connection_close(connection);
+            dbus_connection_unref(connection);
             return -1;
+        }
+        /* __init__ called a second time: do not leak the first connection */
+        TDBUS_LOCK(self);
+        old = self->connection;
+        self->connection = connection;
+        TDBUS_UNLOCK();
+        if (old != NULL) {
+            dbus_connection_close(old);
+            dbus_connection_unref(old);
+        }
     }
     return 0;
 }
@@ -1863,6 +1884,7 @@ static PyObject *
 tdbus_connection_add_filter(PyTDBusConnectionObject *self, PyObject *args)
 {
     int ret;
+    Py_ssize_t i;
     PyObject *filter;
     DBusConnection *connection = NULL;
 
@@ -1889,7 +1911,17 @@ tdbus_connection_add_filter(PyTDBusConnectionObject *self, PyObject *args)
 
     if (!dbus_connection_add_filter(connection,
                 _tdbus_connection_filter_callback, filter, NULL)) {
-        PySequence_DelItem(self->filters, PyList_Size(self->filters) - 1);
+        /* Roll back our append by identity, under the lock: another thread
+         * may have appended in the meantime, so the last item is not
+         * necessarily ours. */
+        TDBUS_LOCK(self);
+        for (i = PyList_Size(self->filters) - 1; i >= 0; i--) {
+            if (PyList_GetItem(self->filters, i) == filter) {
+                PyList_SetSlice(self->filters, i, i + 1, NULL);
+                break;
+            }
+        }
+        TDBUS_UNLOCK();
         RETURN_ERROR("dbus_connection_add_filter() failed");
     }
     dbus_connection_unref(connection);
