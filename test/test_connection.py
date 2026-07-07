@@ -8,8 +8,15 @@ complete list.
 """
 import unittest
 
-from tdbus import SimpleDBusConnection, GEventDBusConnection, DBUS_BUS_SESSION
+from tdbus import SimpleDBusConnection, DBUS_BUS_SESSION
 from .base import BaseTest
+
+try:
+    import gevent
+    from tdbus import GEventDBusConnection
+except ImportError:
+    gevent = None
+    GEventDBusConnection = None
 
 
 class TestSimpleDBusConnection(unittest.TestCase, BaseTest):
@@ -36,6 +43,7 @@ class TestSimpleDBusConnection(unittest.TestCase, BaseTest):
         assert name.startswith(':')
         conn.close()
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestGeventDBusConnection(unittest.TestCase, BaseTest):
     """Test suite for D-BUS connection."""
 

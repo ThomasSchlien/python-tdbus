@@ -12,8 +12,6 @@ import signal
 import subprocess
 import unittest
 
-from nose import SkipTest
-
 import tdbus
 
 
@@ -25,10 +23,12 @@ class BaseTest(object):
 
     @classmethod
     def setUpClass(cls):
+        cls._have_session_bus = False
         try:
-            output = subprocess.check_output(['dbus-launch', '--sh-syntax'])
+            output = subprocess.check_output(['dbus-launch', '--sh-syntax'],
+                                             text=True)
         except OSError:
-            raise SkipTest('dbus-launch is required for running this test')
+            raise unittest.SkipTest('dbus-launch is required for running this test')
         for line in output.splitlines():
             mobj = cls._re_assign.match(line)
             if not mobj:
@@ -42,6 +42,10 @@ class BaseTest(object):
                 # the following is a trick to allow us to have a different
                 # session bus for each test.
                 tdbus.DBUS_BUS_SESSION = value
+                # test modules import DBUS_BUS_SESSION ("<SESSION>") by value
+                # at import time; the environment variable is what makes
+                # libdbus resolve "<SESSION>" to the bus launched above.
+                os.environ['DBUS_SESSION_BUS_ADDRESS'] = value
             elif key == 'DBUS_SESSION_BUS_PID':
                 cls._bus_pid = int(value)
         cls._have_session_bus = True

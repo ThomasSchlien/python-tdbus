@@ -11,12 +11,17 @@ import math
 from threading import Thread
 import unittest
 
-import gevent
-
-from tdbus import GEventDBusConnection, DBUS_BUS_SESSION, DBusError, \
+from tdbus import DBUS_BUS_SESSION, DBusError, \
     SimpleDBusConnection, method, DBusHandler
 from tdbus.handler import signal_handler, dbus_object
 from .base import BaseTest
+
+try:
+    import gevent
+    from tdbus import GEventDBusConnection
+except ImportError:
+    gevent = None
+    GEventDBusConnection = None
 
 
 logging.basicConfig()
@@ -253,14 +258,14 @@ class MessageTest(BaseTest):
     def test_exceptions(self):
         error = self.echo_exception('ss', ['SpecialException', 'message'])
         print(error, type(error))
-        self.assertEquals(error.__class__.__name__, 'SpecialException')
-        self.assertEquals(error.type, 'SpecialException')
-        self.assertEquals(error.args[0], 'message')
+        self.assertEqual(error.__class__.__name__, 'SpecialException')
+        self.assertEqual(error.type, 'SpecialException')
+        self.assertEqual(error.args[0], 'message')
         assert isinstance(error, DBusError)
 
         error = self.echo_exception('s', ['Missing second argument, which raises an ValueError'])
-        self.assertEquals(error.__class__.__name__, 'ValueError')
-        self.assertEquals(error.type, 'ValueError')
+        self.assertEqual(error.__class__.__name__, 'ValueError')
+        self.assertEqual(error.type, 'ValueError')
         self.assertTrue(error.args[0] in  ('need more than 1 value to unpack', 'not enough values to unpack (expected 2, got 1)'))
         assert isinstance(error, DBusError)
 
@@ -323,6 +328,7 @@ class TestMessageASimple(unittest.TestCase, MessageTest):
         super(TestMessageASimple, cls).tearDownClass()
 
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestMessageGEvent(unittest.TestCase, MessageTest):
 
     @classmethod
@@ -335,6 +341,7 @@ class TestMessageGEvent(unittest.TestCase, MessageTest):
         cls.client = GEventDBusConnection(DBUS_BUS_SESSION)
 
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestMessageDecorated(unittest.TestCase, MessageTest):
 
     @classmethod
@@ -347,6 +354,7 @@ class TestMessageDecorated(unittest.TestCase, MessageTest):
         cls.client = GEventDBusConnection(DBUS_BUS_SESSION)
 
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestMessageName(unittest.TestCase, MessageTest):
 
     @classmethod
@@ -360,6 +368,7 @@ class TestMessageName(unittest.TestCase, MessageTest):
         cls.client = GEventDBusConnection(DBUS_BUS_SESSION)
 
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestMessageSignal(unittest.TestCase, MessageTest):
 
     last_message = None
@@ -388,6 +397,7 @@ class TestMessageSignal(unittest.TestCase, MessageTest):
         return self.last_message.get_args()
 
 
+@unittest.skipIf(gevent is None, 'gevent is not available')
 class TestMessageSignalMatched(unittest.TestCase, MessageTest):
 
     last_message = None
