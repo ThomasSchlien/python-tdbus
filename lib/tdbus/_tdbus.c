@@ -489,6 +489,11 @@ tdbus_message_init(PyTDBusMessageObject *self, PyObject *args, PyObject *kwargs)
                 &auto_start, &path, &interface, &member, &error_name, &reply_serial, &destination))
         return -1;
 
+    if (self->message != NULL) {
+        /* __init__ called a second time: do not leak the first message */
+        dbus_message_unref(self->message);
+        self->message = NULL;
+    }
     self->message = dbus_message_new(type);
     CHECK_MEMORY_ERROR(self->message == NULL);
     dbus_message_set_no_reply(self->message, no_reply);
@@ -834,6 +839,8 @@ _tdbus_init_check_number_cache(void)
     int i;
     PyObject *Pnumber;
 
+    if (_tdbus_check_number_cache != NULL)
+        return 1;
     MALLOC(_tdbus_check_number_cache, 11 * sizeof(PyObject *));
     for (i=0; i<11; i++) {
         if ((Pnumber = PyInt_FromString(_tdbus_check_numbers[i],
@@ -980,9 +987,9 @@ static int
 _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
                           PyObject *arg, int depth)
 {
-    int i, size; long l;
+    int i, size, subiter_open = 0; long l;
     char *subtype = NULL, *end, *ptr;
-    PyObject *Parray, *Putf8, *Pitem = NULL, *Ptype = NULL, *Pvalue = NULL;
+    PyObject *Parray = NULL, *Putf8, *Pitem = NULL, *Ptype = NULL, *Pvalue = NULL;
     _tdbus_basic_value value;
     DBusMessageIter subiter;
 
@@ -1131,10 +1138,12 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
         if (!dbus_message_iter_open_container(iter, DBUS_TYPE_STRUCT,
                     NULL, &subiter))
             RETURN_MEMORY_ERROR();
+        subiter_open = 1;
         if (!PySequence_Check(arg))
             RETURN_ERROR("expecting sequence argument for struct format");
         if (!_tdbus_message_append_args(&subiter, format+1, arg, depth+1))
             RETURN_ERROR(NULL);
+        subiter_open = 0;
         if (!dbus_message_iter_close_container(iter, &subiter))
             RETURN_MEMORY_ERROR();
         break;
@@ -1142,6 +1151,7 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
         if (!dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY,
                     format+1, &subiter))
             RETURN_MEMORY_ERROR();
+        subiter_open = 1;
         if (format[1] == DBUS_TYPE_BYTE) {
             if (!PyBytes_Check(arg))
                 RETURN_ERROR("expecting bytes argument for array of byte");
@@ -1154,6 +1164,7 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
                 if (!PyDict_Check(arg))
                     RETURN_ERROR("expecting dict argument for array of dict_entry");
                 Parray = PyDict_Items(arg);
+                CHECK_PYTHON_ERROR(Parray == NULL);
             } else {
                 if (!PySequence_Check(arg))
                     RETURN_ERROR("expecting sequence argument for array format");
@@ -1161,13 +1172,16 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
             }
             for (i=0; i<PySequence_Size(Parray); i++) {
                 Pitem = PySequence_GetItem(Parray, i);
+                CHECK_PYTHON_ERROR(Pitem == NULL);
                 if (!_tdbus_message_append_arg(&subiter, format+1, Pitem, depth+1))
                     RETURN_ERROR(NULL);
                 Py_DECREF(Pitem); Pitem = NULL;
             }
             if (Parray != arg)
                 Py_DECREF(Parray);
+            Parray = NULL;
         }
+        subiter_open = 0;
         if (!dbus_message_iter_close_container(iter, &subiter))
             RETURN_MEMORY_ERROR();
         break;
@@ -1175,10 +1189,12 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
         if (!dbus_message_iter_open_container(iter, DBUS_TYPE_DICT_ENTRY,
                     NULL, &subiter))
             RETURN_MEMORY_ERROR();
+        subiter_open = 1;
         if (!PySequence_Check(arg))
             RETURN_ERROR("expecting sequence argument for dict_entry format");
         if (!_tdbus_message_append_args(&subiter, format+1, arg, depth+1))
             RETURN_ERROR(NULL);
+        subiter_open = 0;
         if (!dbus_message_iter_close_container(iter, &subiter))
             RETURN_MEMORY_ERROR();
         break;
@@ -1186,7 +1202,9 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
         if (!PySequence_Check(arg) || PySequence_Size(arg) != 2)
             RETURN_ERROR("expecting a sequence argument of length 2 for variant");
         Ptype = PySequence_GetItem(arg, 0);
+        CHECK_PYTHON_ERROR(Ptype == NULL);
         Pvalue = PySequence_GetItem(arg, 1);
+        CHECK_PYTHON_ERROR(Pvalue == NULL);
 
         if (PyUnicode_Check(Ptype)) {
             Putf8 = PyUnicode_AsUTF8String(Ptype);
@@ -1206,8 +1224,10 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
             RETURN_ERROR("variant signature must be exactly one full type");
         if (!dbus_message_iter_open_container(iter, *format, subtype, &subiter))
             RETURN_MEMORY_ERROR();
+        subiter_open = 1;
         if (!_tdbus_message_append_arg(&subiter, subtype, Pvalue, depth+1))
             RETURN_ERROR(NULL);
+        subiter_open = 0;
         if (!dbus_message_iter_close_container(iter, &subiter))
             RETURN_MEMORY_ERROR();
         Py_DECREF(Ptype); Ptype = NULL;
@@ -1220,6 +1240,11 @@ _tdbus_message_append_arg(DBusMessageIter *iter, char *format,
     return 1;
 
 error:
+    if (subiter_open)
+        /* frees the resources of the never-closed sub-iterator; the
+         * half-built message is discarded by the caller anyway */
+        dbus_message_iter_abandon_container(iter, &subiter);
+    if (Parray != NULL && Parray != arg) Py_DECREF(Parray);
     if (Pitem != NULL) Py_DECREF(Pitem);
     if (Ptype != NULL) Py_DECREF(Ptype);
     if (Pvalue != NULL) Py_DECREF(Pvalue);
