@@ -1425,6 +1425,7 @@ typedef struct
     PyObject_HEAD
     DBusConnection *connection;
     PyObject *loop;
+    PyObject *filters;
 } PyTDBusConnectionObject;
 
 PyTypeObject PyTDBusConnectionType =
@@ -1523,19 +1524,51 @@ tdbus_connection_init(PyTDBusConnectionObject *self, PyObject *args,
     return 0;
 }
 
+/* The connection participates in reference cycles by design: it holds strong
+ * references to the loop object and the filter callables, and those usually
+ * reference the connection back. The type therefore must support cyclic
+ * garbage collection, otherwise every connection is leaked. To make all
+ * references visible to the collector, libdbus is given only borrowed
+ * pointers (free_function = NULL); the owning references live in self->loop
+ * and self->filters and are dropped only after the libdbus connection has
+ * been closed and released. */
+
+static int
+tdbus_connection_traverse(PyTDBusConnectionObject *self, visitproc visit,
+                          void *arg)
+{
+    Py_VISIT(self->loop);
+    Py_VISIT(self->filters);
+    return 0;
+}
+
+static int
+tdbus_connection_clear(PyTDBusConnectionObject *self)
+{
+    DBusConnection *connection;
+
+    /* Close the libdbus connection before dropping the loop and filter
+     * references: closing still invokes remove_watch/remove_timeout
+     * callbacks on the loop through the borrowed pointers. */
+    TDBUS_LOCK(self);
+    connection = self->connection;
+    self->connection = NULL;
+    TDBUS_UNLOCK();
+    if (connection != NULL) {
+        dbus_connection_close(connection);
+        dbus_connection_unref(connection);
+    }
+    Py_CLEAR(self->loop);
+    Py_CLEAR(self->filters);
+    return 0;
+}
+
 static void
 tdbus_connection_dealloc(PyTDBusConnectionObject *self)
 {
-    if (self->connection) {
-        dbus_connection_close(self->connection);
-        dbus_connection_unref(self->connection);
-        self->connection = NULL;
-    }
-    if (self->loop) {
-        Py_DECREF(self->loop);
-        self->loop = NULL;
-    }
-    PyObject_Del(self);
+    PyObject_GC_UnTrack(self);
+    tdbus_connection_clear(self);
+    PyObject_GC_Del(self);
 }
 
 static PyObject *
@@ -1768,16 +1801,17 @@ tdbus_connection_set_loop(PyTDBusConnectionObject *self, PyObject *args)
     TDBUS_UNLOCK();
     Py_XDECREF(old);
 
-    Py_INCREF(loop);
+    /* libdbus gets borrowed references; self->loop owns the loop and is
+     * released only after the connection has been closed. This keeps the
+     * loop reachable for the cyclic garbage collector. */
     if (!dbus_connection_set_watch_functions(connection,
             _tdbus_add_watch_callback, _tdbus_remove_watch_callback,
-            _tdbus_watch_toggled_callback, loop, _tdbus_decref))
+            _tdbus_watch_toggled_callback, loop, NULL))
         RETURN_ERROR("dbus_connection_set_watch_functions() failed");
 
-    Py_INCREF(loop);
     if (!dbus_connection_set_timeout_functions(connection,
             _tdbus_add_timeout_callback, _tdbus_remove_timeout_callback,
-            _tdbus_timeout_toggled_callback, loop, _tdbus_decref))
+            _tdbus_timeout_toggled_callback, loop, NULL))
         RETURN_ERROR("dbus_connection_set_timeout_functions() failed");
 
     dbus_connection_unref(connection);
@@ -1825,6 +1859,7 @@ _tdbus_connection_filter_callback(DBusConnection *connection,
 static PyObject *
 tdbus_connection_add_filter(PyTDBusConnectionObject *self, PyObject *args)
 {
+    int ret;
     PyObject *filter;
     DBusConnection *connection = NULL;
 
@@ -1835,10 +1870,23 @@ tdbus_connection_add_filter(PyTDBusConnectionObject *self, PyObject *args)
 
     if (!PyCallable_Check(filter))
         RETURN_ERROR("expecting a Python callable");
-    Py_INCREF(filter);
+
+    /* Own the filter reference in self->filters so that the cyclic garbage
+     * collector can see it; libdbus gets a borrowed pointer that stays valid
+     * until the connection is closed in clear/dealloc. */
+    TDBUS_LOCK(self);
+    if (self->filters == NULL)
+        self->filters = PyList_New(0);
+    if (self->filters != NULL)
+        ret = PyList_Append(self->filters, filter);
+    else
+        ret = -1;
+    TDBUS_UNLOCK();
+    CHECK_PYTHON_ERROR(ret < 0);
+
     if (!dbus_connection_add_filter(connection,
-                _tdbus_connection_filter_callback, filter, _tdbus_decref)) {
-        Py_DECREF(filter);
+                _tdbus_connection_filter_callback, filter, NULL)) {
+        PySequence_DelItem(self->filters, PyList_Size(self->filters) - 1);
         RETURN_ERROR("dbus_connection_add_filter() failed");
     }
     dbus_connection_unref(connection);
@@ -2105,7 +2153,7 @@ void init_tdbus(void) {
             type.tp_new = PyType_GenericNew; \
             type.tp_init = (initproc) init; \
             type.tp_dealloc = (destructor) dealloc; \
-            type.tp_flags = Py_TPFLAGS_DEFAULT; \
+            type.tp_flags |= Py_TPFLAGS_DEFAULT; \
             type.tp_doc = "D-BUS " name " Object"; \
             type.tp_methods = methods; \
             if (PyType_Ready(&type) < 0) INITERROR; \
@@ -2120,6 +2168,9 @@ void init_tdbus(void) {
                   tdbus_message_init, tdbus_message_dealloc);
     FINALIZE_TYPE(PyTDBusPendingCallType, "PendingCall", tdbus_pending_call_methods,
                   NULL, tdbus_pending_call_dealloc);
+    PyTDBusConnectionType.tp_flags = Py_TPFLAGS_HAVE_GC;
+    PyTDBusConnectionType.tp_traverse = (traverseproc) tdbus_connection_traverse;
+    PyTDBusConnectionType.tp_clear = (inquiry) tdbus_connection_clear;
     FINALIZE_TYPE(PyTDBusConnectionType, "Connection", tdbus_connection_methods,
                   tdbus_connection_init, tdbus_connection_dealloc);
 

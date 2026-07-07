@@ -6,7 +6,9 @@ was provided together with this source file for the licensing terms.
 Copyright (c) 2012 the python-tdbus authors. See the file "AUTHORS" for a
 complete list.
 """
+import gc
 import unittest
+import weakref
 
 from tdbus import SimpleDBusConnection, DBUS_BUS_SESSION
 from .base import BaseTest
@@ -42,6 +44,23 @@ class TestSimpleDBusConnection(unittest.TestCase, BaseTest):
         name = conn.get_unique_name()
         assert name.startswith(':')
         conn.close()
+
+    def test_connection_collected_after_close(self):
+        # The connection and its loop form a reference cycle; the C
+        # Connection type supports cyclic GC so it must be reclaimed.
+        conn = SimpleDBusConnection(DBUS_BUS_SESSION)
+        ref = weakref.ref(conn._connection.get_loop())
+        conn.close()
+        del conn
+        gc.collect()
+        self.assertIsNone(ref())
+
+    def test_connection_collected_without_close(self):
+        conn = SimpleDBusConnection(DBUS_BUS_SESSION)
+        ref = weakref.ref(conn._connection.get_loop())
+        del conn
+        gc.collect()
+        self.assertIsNone(ref())
 
 @unittest.skipIf(gevent is None, 'gevent is not available')
 class TestGeventDBusConnection(unittest.TestCase, BaseTest):
