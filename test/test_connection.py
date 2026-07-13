@@ -77,6 +77,35 @@ class TestSimpleDBusConnection(unittest.TestCase, BaseTest):
         gc.collect()
         self.assertIsNone(ref())
 
+    @unittest.skipUnless(hasattr(os, 'fork'), 'requires os.fork')
+    def test_use_after_fork_raises(self):
+        # libdbus connections cannot be used across fork(); using one in
+        # the child must raise instead of silently hanging.
+        conn = SimpleDBusConnection(DBUS_BUS_SESSION)
+        pid = os.fork()
+        if pid == 0:
+            # child: report the outcome through the exit status
+            try:
+                conn.call_method('/org/freedesktop/DBus', 'GetId',
+                                 'org.freedesktop.DBus',
+                                 destination='org.freedesktop.DBus',
+                                 timeout=1)
+            except RuntimeError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 0)
+        # the parent's connection must remain usable
+        reply = conn.call_method('/org/freedesktop/DBus', 'GetId',
+                                 'org.freedesktop.DBus',
+                                 destination='org.freedesktop.DBus',
+                                 timeout=5)
+        self.assertTrue(reply.get_args())
+        conn.close()
+
 @unittest.skipIf(gevent is None, 'gevent is not available')
 class TestGeventDBusConnection(unittest.TestCase, BaseTest):
     """Test suite for D-BUS connection."""
@@ -101,3 +130,43 @@ class TestGeventDBusConnection(unittest.TestCase, BaseTest):
         name = conn.get_unique_name()
         assert name.startswith(':')
         conn.close()
+
+    def test_timeout_toggled_interval_change(self):
+        # timeout_toggled() with a changed interval used to create the new
+        # timer with the old interval and store a bare event where every
+        # other path expects an (interval, event) tuple, crashing the next
+        # remove_timeout()/timeout_toggled().
+        from tdbus.gevent import GEventLoop
+
+        class FakeTimeout(object):
+            def __init__(self, interval):
+                self.interval = interval
+                self.enabled = True
+                self.data = None
+            def get_interval(self):
+                return self.interval
+            def get_enabled(self):
+                return self.enabled
+            def set_data(self, data):
+                self.data = data
+            def get_data(self):
+                return self.data
+
+        loop = GEventLoop(None)
+        timeout = FakeTimeout(1000)
+        loop.add_timeout(timeout)
+        interval, event = timeout.get_data()
+        self.assertEqual(interval, 1000)
+        # disable, then re-enable with a changed interval (the sequence
+        # libdbus uses when it adjusts a timeout)
+        timeout.enabled = False
+        loop.timeout_toggled(timeout)
+        timeout.interval = 2000
+        timeout.enabled = True
+        loop.timeout_toggled(timeout)
+        new_interval, new_event = timeout.get_data()
+        self.assertEqual(new_interval, 2000)
+        self.assertIsNot(new_event, event)
+        # remove_timeout() must be able to unpack the stored data
+        loop.remove_timeout(timeout)
+        self.assertIsNone(timeout.get_data())

@@ -80,11 +80,13 @@ class GEventLoop(EventLoop):
     def timeout_toggled(self, timeout):
         interval, event = timeout.get_data()
         if timeout.get_enabled():
-            if interval != timeout.get_interval():
+            new_interval = timeout.get_interval()
+            if interval != new_interval:
                 # Change interval => create new timer
                 event.stop()
-                event = get_hub().loop.timer(interval / 1000, interval / 1000)
-                timeout.set_data(event)
+                event = get_hub().loop.timer(new_interval / 1000,
+                                             new_interval / 1000)
+                timeout.set_data((new_interval, event))
             event.start(self._handle_timeout, timeout)
         else:
             event.stop()

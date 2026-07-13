@@ -7,6 +7,7 @@
 # complete list.
 
 import logging
+import os
 import sys
 import traceback
 
@@ -33,12 +34,26 @@ class DBusConnection(object):
         """Create a new connection."""
         if self.Loop is None:
             raise NotImplementedError('cannot create Connection without a Loop')
+        self._pid = os.getpid()
         self._connection = _tdbus.Connection(address)
         self._connection.set_loop(self.Loop(self._connection))
         self._connection.add_filter(self._dispatch)
         self.handlers = []
         self.objects = {}
         self.logger = logging.getLogger('tdbus')
+
+    def _check_fork(self):
+        # libdbus connections must not be used across fork(): the socket is
+        # shared with the parent, and any event loop watches belong to the
+        # parent's loop. Fail loudly instead of hanging silently.
+        pid = os.getpid()
+        if pid != self._pid:
+            raise RuntimeError('D-Bus connection created in process %d is '
+                               'being used in process %d; libdbus connections '
+                               'cannot be used across fork(). Create the '
+                               'connection after forking (e.g. in a uwsgi '
+                               'postfork hook, or with lazy-apps = true).'
+                               % (self._pid, pid))
 
     def add_handler(self, handler):
         """Add a new method/signal handler for this connection."""
@@ -114,6 +129,7 @@ class DBusConnection(object):
 
     def send_method_return(self, message, format=None, args=None):
         """Send a method call return."""
+        self._check_fork()
         reply = _tdbus.Message(_tdbus.DBUS_MESSAGE_TYPE_METHOD_RETURN,
                                reply_serial=message.get_serial(),
                                destination=message.get_sender())
@@ -123,6 +139,7 @@ class DBusConnection(object):
 
     def send_error(self, message, error_name, format=None, args=None):
         """Send an error reply."""
+        self._check_fork()
         reply = _tdbus.Message(_tdbus.DBUS_MESSAGE_TYPE_ERROR,
                                reply_serial=message.get_serial(),
                                destination=message.get_sender(),
@@ -134,6 +151,7 @@ class DBusConnection(object):
     def send_signal(self, path, member, interface=None, format=None, args=None,
                     destination=None):
         """Send a signal."""
+        self._check_fork()
         if '.' in member:
             member, interface = self._split_member(member)
         if interface is None:
@@ -170,6 +188,7 @@ class DBusConnection(object):
     def call_method(self, path, member, interface=None, format=None, args=None,
                     destination=None, callback=None, timeout=None):
         """Call a method."""
+        self._check_fork()
         if '.' in member:
             member, interface = self._split_member(member)
         if interface is None:
